@@ -1,0 +1,13 @@
+pydantic
+databricks
+pandas
+google-genai
+databricks-sql-connector
+pyarrow
+imapclient
+gspread
+gspread-dataframe
+oauth2client
+pyMuPDF
+xlrd>=2.0.1
+google-cloud-storage
