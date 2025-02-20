@@ -19,7 +19,7 @@ import functools
 import time
 import fitz
 import re
-from utils import  get_existing_po_codes, composeAndSendEmail, upload_file_to_gcs, send_email, send_email_with_sender_fallback
+from utils import  get_existing_po_codes, upload_file_to_gcs, send_email, send_email_with_sender_fallback
 import multiprocessing
 from google.cloud import storage
 import io
@@ -649,7 +649,7 @@ def process_all_emails():
         else:
             logging.warning(f"No ASN paths returned for {emailAddress}, skipping composeAndSendEmail.")
 
-    #conn.close()
+    conn.close()
 
 
 def composeAndSendEmail( email_address, final_new_paths, TRUE_DIR):
@@ -749,7 +749,7 @@ if __name__ == "__main__":
     process_all_emails()
 
     #process_all_emails()
-    conn.close()
+    
     #conn.close()
     
 # result = app("invoice2.pdf")

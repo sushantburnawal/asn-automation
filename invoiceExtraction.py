@@ -157,7 +157,7 @@ def process_email_row(row, since_hours=1, base_local_folder="downloaded_attachme
                        #print(f"[INFO] Saved attachment for '{manufacturer}' to: {save_path}")
                         
 
-def main():
+def getInvoices():
     # Get the list of manufacturers from the Google Sheet
     manufs = get_manufs_final()
     
@@ -175,4 +175,4 @@ def main():
             print(f"[ERROR] Error processing email: {e}")
 
 if __name__ == "__main__":
-    main()
+    getInvoices()

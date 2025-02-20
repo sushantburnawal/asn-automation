@@ -1,6 +1,7 @@
-from pdfParse import process_all_manufacturers
-
+from pdfParse import process_all_emails
+from invoiceExtraction import getInvoices
 
 if __name__ == "__main__":
-    process_all_manufacturers()
+    getInvoices()
+    process_all_emails()
     
