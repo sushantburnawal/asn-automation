@@ -19,7 +19,7 @@ import functools
 import time
 import fitz
 import re
-from utils import  get_existing_po_codes, upload_file_to_gcs, send_email, send_email_with_sender_fallback
+from utils import  get_existing_po_codes, upload_file_to_gcs, send_email, send_email_with_sender_fallback, delete_gcs_folder
 import multiprocessing
 from google.cloud import storage
 import io
@@ -53,10 +53,22 @@ DATABRICKS_SERVER_HOSTNAME = config_data.get("hostname")
 DATABRICKS_ACCESS_TOKEN = config_data.get("accessToken")
 DATABRICKS_HTTP_PATH = config_data.get("warehouseHTTPPath")
 
+
+model_id =  "gemini-2.0-flash-001" # or "gemini-2.0-flash-lite-preview-02-05"  , "gemini-2.0-pro-exp-02-05"
+
+#----------------
+# Vertex AI for PROD
+#----------------
+
 client = genai.Client(http_options=HttpOptions(api_version="v1"),
   vertexai=True, project="decisive-talon-451317-d6", location="us-central1",
 )
-model_id =  "gemini-2.0-flash-001" # or "gemini-2.0-flash-lite-preview-02-05"  , "gemini-2.0-pro-exp-02-05"
+
+#----------------
+# Gemini API for LOCAL
+#----------------
+
+# client = genai.Client(api_key=config_data.get("api_key"))
 
 
     
@@ -112,7 +124,7 @@ class PO(BaseModel):
 
 class Item(BaseModel):
     description: str = Field(description="The description of the item")
-    quantity: float = Field(description="The Quanitity of the item")
+    quantity: float = Field(description="The Quanitity of the item in the invoice can be represented as Quantity or Qty or Quantity of Cases ; If both are present then Quantity should be considered.")
     mrp: float = Field(description="The MRP of the item, STRICTYLY EXTRACT MRP AND NOT NLC OR SALE PRICE.")
 
 class Invoice(BaseModel):
@@ -180,13 +192,7 @@ def split_pdf(gcs_uri, max_pages=4):
 @retry(max_retries=10, backoff_factor=1, exceptions=(Exception,))
 def po_details(PO_NUMBER):
         if len(PO_NUMBER) == 7:
-            query = F"""SELECT 
-                            LOWER(sku) as product_variant_id, 
-                            CONCAT(product_name, ' ', pack_size, ' ', uom) AS product_name 
-                        FROM 
-                            gold.ops.pl_po_details 
-                        WHERE
-                            externpocode='{PO_NUMBER}' """
+            query = F"""SELECT LOWER(sku) AS product_variant_id, CONCAT(product_name, ' ', pack_size, ' ', uom) AS product_name FROM gold.ops.pl_po_details WHERE externpocode = '{PO_NUMBER}' """
         else:
             query = F"""SELECT 
                             LOWER(a.pvid) AS product_variant_id,
@@ -248,6 +254,36 @@ def extract_structured_data(file_path: str, email_address: str = None, model: Ba
 
     result = response.parsed
     return json.loads(result.model_dump_json())
+
+@retry(max_retries=10, backoff_factor=1, exceptions=(Exception,))
+def extract_structured_data_from_local(file_path: str, email_address: str = None, model: BaseModel = Invoice):
+    """
+    Extracts structured data using Vertex AI. If file_path is already a GCS URI,
+    it will be used directly. Otherwise, the file is uploaded to GCS.
+    """
+    # # If file_path already is a GCS URI, use it directly.
+    # if file_path.startswith("gs://"):
+    #     file_uri = file_path
+    # # else:
+    # #     file_ref = upload_file_to_gcs(file_path, email_address)
+    # #     file_uri = file_ref["gcsUri"]
+        
+    prompt = "Extract the structured data from the following PDF file"
+    logging.info(f"Extracting structured data from {file_path} using model {model.__name__}")
+    #tokens_used = client.models.count_tokens(model=model_id, contents=[prompt, file_path])
+    
+    pdf_file = Part.from_file(
+                file_path=file_path,
+                mime_type="application/pdf",
+                ) 
+    tokens_used = client.models.count_tokens(model=model_id, contents=[prompt, pdf_file])  
+    logging.info(f"Tokens needed for extract_structured_data: {tokens_used}")
+    response = generate_content_with_retry(
+         model=model_id,
+         contents=[prompt,pdf_file],config={'response_mime_type': 'application/json', 'response_schema': model})
+    
+    if response is None or response.parsed is None:
+        logging.error(f"Failed to generate content for structured data extraction from {file_path}. Response: {response}")
     
 def invoice_pdf(pdf_path):
     return client.files.upload(file= pdf_path, config={'display_name': 'invoice'})
@@ -378,6 +414,22 @@ def quality_checks(df: pd.DataFrame, sql_mapping: dict) -> pd.DataFrame:
     
     return df
 
+
+# Adjust the delivered quantity based on closeness to po_qty or (quantity * total_case_pack)
+def adjust_quantity(row):
+    # If total_case_pack is missing, return delivered quantity as-is.
+    if pd.isna(row["total_case_pack"]):
+        return row["quantity"]
+    delivered = row["quantity"]
+    multiplied = delivered * row["total_case_pack"]
+    po_qty = row["po_qty"]
+    # Choose the option that is closer to the ordered quantity.
+    if abs(po_qty - delivered) <= abs(po_qty - multiplied):
+        return delivered
+    else:
+        return multiplied
+    
+
 def asn_creation(df, TRUE_DIR, existing_po_codes ,check_flag=True):
     os.makedirs(TRUE_DIR, exist_ok=True)
     output_paths = []
@@ -394,32 +446,57 @@ def asn_creation(df, TRUE_DIR, existing_po_codes ,check_flag=True):
     p_list = df["PO_Number"].unique().tolist()
     if p_list:
         po_code_string = ", ".join(f"'{p}'" for p in p_list)
-        query_nexus = f"""select *
-        from (SELECT 
-            externpocode as po_code, 
-            sku, 
+        combined_query = f"""
+        WITH nexus AS (
+            SELECT 
+            externpocode AS po_code, 
+            LOWER(sku) AS sku, 
             po_qty, 
             product_name, 
             CAST(FLOOR(MAX(unit_base_cost) OVER (PARTITION BY externpocode, sku) * 100) / 100 AS DECIMAL(10,2)) AS unit_price, 
             CAST(FLOOR(MAX(unit_mrp) OVER (PARTITION BY externpocode, sku) * 100) / 100 AS DECIMAL(10,2)) AS MRP
             FROM gold.ops.pl_po_details
             WHERE externpocode IN ({po_code_string})
+        ),
+        case_pack AS (
+            SELECT 
+            b.externpocode AS po_code,
+            LOWER(b.sku) AS product_variant_id, 
+            CONCAT(b.product_name, ' ', b.pack_size, ' ', b.uom) AS case_product_name,
+            b.po_qty AS cp_po_qty,
+            (a.OUTER_CASE_PACK * a.INNER_CASE_PACK) AS total_case_pack
+            FROM gold.planning.vendor_product_mapping_master a
+            JOIN gold.ops.pl_po_details b
+              ON a.MH_ID = b.wh_id 
+             AND a.PRODUCT_VARIANT_ID = LOWER(b.sku)
+            WHERE b.externpocode IN ({po_code_string})
         )
-        group by all"""
+        SELECT 
+            n.po_code,
+            n.sku,
+            n.po_qty,
+            n.product_name,
+            n.unit_price,
+            n.MRP,
+            cp.total_case_pack
+        FROM nexus n
+        LEFT JOIN case_pack cp
+          ON n.po_code = cp.po_code AND n.sku = cp.product_variant_id;
+        """
         
-        # code to run databricks in python
         cursor = conn.cursor()
-        cursor.execute(query_nexus)
-        results = cursor.fetchall()
+        cursor.execute(combined_query)
+        results_combined = cursor.fetchall()
         columns = [col[0] for col in cursor.description]
-        po_gsheet_df = pd.DataFrame(results, columns=columns)
-        
-        
-
+        po_gsheet_df = pd.DataFrame(results_combined, columns=columns)
     else:
-        # No POs to look up, so we can skip the query or create an empty DataFrame
-        po_gsheet_df = pd.DataFrame(columns=["po_code","sku","MRP","unit_price","po_qty","product_name"])
-        
+        po_gsheet_df = pd.DataFrame(columns=["po_code", "sku", "po_qty", "product_name", "unit_price", "MRP", "total_case_pack"])
+
+
+    
+    
+    # Merge the po_gsheet_df with the df on product_variant_id and sku
+    merged_df = df.merge(po_gsheet_df, left_on=["product_variant_id", "PO_Number"], right_on=["sku", "po_code"], how="left", suffixes=("", "_po"))
     
     # -----------
     # Additional Merge for SAP-PO
@@ -433,7 +510,22 @@ def asn_creation(df, TRUE_DIR, existing_po_codes ,check_flag=True):
     results_sap = cursor.fetchall()
     columns = [col[0] for col in cursor.description]
     skucode_mapping = pd.DataFrame(results_sap, columns=columns)
-    final_df = df.merge(skucode_mapping, left_on="product_variant_id", right_on="product_variant_id", how="left",suffixes=("", "_sql") )
+
+    final_df = merged_df.merge(skucode_mapping, left_on="product_variant_id", right_on="product_variant_id", how="left",suffixes=("", "_sql") )
+
+    # ------------
+    # Checking invoice quantity with case quantity
+    # ------------
+
+    # Ensure numeric types for the columns
+    final_df["po_qty"] = pd.to_numeric(final_df["po_qty"], errors="coerce")
+    final_df["quantity"] = pd.to_numeric(final_df["quantity"], errors="coerce")
+    final_df["total_case_pack"] = pd.to_numeric(final_df["total_case_pack"], errors="coerce").fillna(1)
+
+    
+
+    final_df["quantity"] = final_df.apply(adjust_quantity, axis=1)
+
 
     # Filter final_df to include only PO_Numbers that start with 'P' or '3'
     final_df = final_df[final_df['PO_Number'].str.startswith(('P', '3'))]
@@ -465,16 +557,16 @@ def asn_creation(df, TRUE_DIR, existing_po_codes ,check_flag=True):
                 "MRP": "mrp",
                 "po_qty": "poRemainingQuantity",
                 "unit_price": "costPrice",
-                "Quantity": "quantity"
+                "quantity": "Quantity"
             }
             group_final.rename(columns=col_map_2, inplace=True)
             group_final.drop_duplicates(inplace=True)
 
-            group_final["quantity"] = group_final["quantity"].astype(int)
+            group_final["Quantity"] = group_final["Quantity"].astype(int)
             group_final = group_final.groupby([
                 "referenceNumber","poCode","productVariantID","productName",
                 "mrp","poRemainingQuantity","costPrice"
-            ], as_index=False)["quantity"].sum()
+            ], as_index=False)["Quantity"].sum()
 
             out_file = f"{TRUE_DIR}/ASN_{po_no}.csv"
             group_final.to_csv(out_file, index=False)
@@ -617,6 +709,40 @@ def process_email(emailAddress: str):
     else:
         logging.warning(f"No matching PDFs found for {emailAddress}")
 
+def get_emails_from_gcs():
+    """
+    Get a list of email addresses from the GCS folder structure.
+    The email addresses are extracted from the folder names under GCS_BASE_PATH.
+    """
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(GCS_BUCKET)
+    
+    # List all blobs under GCS_BASE_PATH and extract the unique email folder names
+    blobs = bucket.list_blobs(prefix=GCS_BASE_PATH)
+    email_folders = set()
+    for blob in blobs:
+        parts = blob.name.split('/')
+        # parts[0] should be GCS_BASE_PATH directory (e.g., "gcs_files")
+        # parts[1] should be "invoices"
+        # parts[2] is the email address folder
+        if len(parts) >= 3:
+            email_folders.add(parts[2])
+    
+    return email_folders
+
+def get_emails_from_local():
+    """
+    Get a list of email addresses from the local folder structure.
+    The email addresses are extracted from the folder names under GCS_BASE_PATH.
+    """
+    base_path = "download_attachments"
+    email_folders = set()
+    for root, dirs, files in os.walk(base_path):
+        for dir_name in dirs:
+            email_folders.add(dir_name)
+    return email_folders
+
+
 def process_all_emails():
     """
     Process each email folder stored in GCS serially.
@@ -628,27 +754,31 @@ def process_all_emails():
     output_dir = "pdf_output"
     os.makedirs(output_dir, exist_ok=True)
     
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(GCS_BUCKET)
+    # storage_client = storage.Client()
+    # bucket = storage_client.bucket(GCS_BUCKET)
     
-    # List all blobs under GCS_BASE_PATH and extract the unique email folder names.
-    blobs = bucket.list_blobs(prefix=GCS_BASE_PATH)
-    email_folders = set()
-    for blob in blobs:
-        parts = blob.name.split('/')
-        # parts[0] should be GCS_BASE_PATH directory (e.g., "gcs_files")
-        # parts[1] should be "invoices"
-        # parts[2] is the email address folder
-        if len(parts) >= 3:
-            email_folders.add(parts[2])
+    # # List all blobs under GCS_BASE_PATH and extract the unique email folder names.
+    # blobs = bucket.list_blobs(prefix=GCS_BASE_PATH)
+    # email_folders = set()
+    # for blob in blobs:
+    #     parts = blob.name.split('/')
+    #     # parts[0] should be GCS_BASE_PATH directory (e.g., "gcs_files")
+    #     # parts[1] should be "invoices"
+    #     # parts[2] is the email address folder
+    #     if len(parts) >= 3:
+    #         email_folders.add(parts[2])
+
+    email_folders = get_emails_from_gcs()
     
     for emailAddress in tqdm(email_folders, desc="Processing Emails"):
         finalASNpaths = process_email(emailAddress)
         if finalASNpaths:
-            composeAndSendEmail( emailAddress, finalASNpaths, os.path.join(output_dir, emailAddress))
+            #composeAndSendEmail( emailAddress, finalASNpaths, os.path.join(output_dir, emailAddress))
+            pass
         else:
             logging.warning(f"No ASN paths returned for {emailAddress}, skipping composeAndSendEmail.")
 
+        # delete_gcs_folder(emailAddress)
     conn.close()
 
 
@@ -693,7 +823,7 @@ def composeAndSendEmail( email_address, final_new_paths, TRUE_DIR):
         # ("fallback1@zeptonow.com", "fallback1_password")
         # ("fallback2@zeptonow.com", "fallback2_password")
         ]
-    recipient_emails = [email_address, 'roohi.raj@zeptonow.com']
+    recipient_emails = [email_address, 'roohi.raj@zeptonow.com','aman.ajmera@zeptonow.com']
 
 
     from zoneinfo import ZoneInfo

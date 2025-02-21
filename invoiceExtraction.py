@@ -99,10 +99,10 @@ def process_email_row(row, since_hours=1, base_local_folder="downloaded_attachme
     # zepto_pvid_type  = row["zepto_pvid_Type"]
     # delete_folders   = row.get("delete_folders", "No")
     
-    TRUE_DIR = f"{base_local_folder}/{email_address}_TRUE"
-    RAW_DIR  = f"{base_local_folder}/{email_address}_RAW"
+    #TRUE_DIR = f"{base_local_folder}/{email_address}_TRUE"
+    RAW_DIR  = f"{base_local_folder}/{email_address}"
     os.makedirs(RAW_DIR, exist_ok=True)
-    os.makedirs(TRUE_DIR, exist_ok=True)
+    #os.makedirs(TRUE_DIR, exist_ok=True)
     
     #print(f"[INFO] Processing manufacturer '{manufacturer}' using email '{email_address}'")
     

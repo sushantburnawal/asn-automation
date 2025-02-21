@@ -35,7 +35,25 @@ def upload_file_to_gcs(file_path: str, email_address: str = None) -> dict:
     except Exception as e:
         logging.error(f"Error uploading file {file_path} to GCS: {e}")
         raise e
-    
+
+def delete_gcs_folder(email_address: str):
+    """
+    Delete all blobs within a folder in Google Cloud Storage.
+    """
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(GCS_BUCKET)
+        prefix = os.path.join(GCS_BASE_PATH, email_address) + "/"  # Ensure trailing slash for folder deletion
+
+        blobs = bucket.list_blobs(prefix=prefix)
+        for blob in blobs:
+            blob.delete()
+            logging.info(f"Blob {blob.name} deleted")
+
+        logging.info(f"Folder {prefix} in GCS bucket {GCS_BUCKET} deleted successfully")
+    except Exception as e:
+        logging.error(f"Error deleting folder {email_address} in GCS: {e}")
+        raise e
 
 def send_email_with_sender_fallback(recipient_emails, subject, body, attachment_path,
                                     sender_credentials_list,
